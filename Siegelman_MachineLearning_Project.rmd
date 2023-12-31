@@ -1,0 +1,216 @@
+---
+title: "Siegelman_MachineLearning_Project"
+author: "Ben Siegelman"
+date: "`r Sys.Date()`"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE, results = FALSE, message = FALSE, warning = FALSE, error = FALSE)
+```
+
+## Executive Summary
+This report describes the creation and execution of a predictive model on motion sensor data, designed to predict the type of movement being done. The data was pre-processed into training, testing, and validation sets and compressed using logical decisions and assessment of highly correlated variables. A random forest model was selected and run on the testing set. It was then explored for possible problems and run again on the validation set. Errors were examined and assessed. The estimated accuracy of the model on out of sample data is described in bolded text towards the bottom of the report.
+
+## Question
+The prediction process works best when guided by a specific, concrete question. In our case, the question is: What combination of variables best indicate which manner of exercise or "classe" is being performed?
+
+## Pre-Processing
+The link to further information about the data did not work for me, so I did not have the benefit of metadata explaining the meaning of variables. Given that, I had to find ways to compress the data without removing information important for prediction. After examining the data and viewing the correlation matrix (see Appendix), I decided to exclude the following:
+- All columns in which < 50% of cells had values.
+- Username and timestamp columns, which are logically not good predictors.
+- ‘new_window’ because it has near-zero variance.
+- ‘num_window’ because it is an indexing variable unlikely to predict.
+- ‘X’ because it is an indexing column whose linear correlation with ‘classe’ is an artifact of data ordering.
+- All three ‘gyros_dumbbell’ variables because once extreme outliers were removed, they had near zero variance. 
+- All accel_belt variables because all three have correlations with ‘roll_belt’ of over 90%.
+
+This reduced the number of potential predictors from 159 to 45.
+
+```{r, preprocess}
+##load data
+library(readr)
+data <- read.csv("~/R/Coursera/MachineLearning_Project/pml-training.csv")
+test_set_quiz <- read.csv("~/R/Coursera/MachineLearning_Project/pml-testing.csv")
+
+## pre-process data
+library(dplyr)
+data <- data %>%
+     mutate(classe = as.factor(classe))
+
+set.seed(1234)
+library(mlbench)
+## slice training set into train (60%), test (20%), and validation (20%) sets
+library(caret)
+train_index <- createDataPartition(y = data$classe, p = 0.8, list = FALSE)
+test_index <- createDataPartition(y = train_index, p = 0.25, list = FALSE)
+training <- data[train_index[-test_index], ]
+testing <- data[train_index[test_index], ]
+validation <- data[-c(train_index, train_index[test_index]), ]
+
+## remove columns with at least half of cells NA or blank
+training <- training %>%
+     select_if(~ sum(!is.na(.) & . != "") >= 19622/2) %>%
+     select(-(2:5))
+training <- training %>%
+     select(-(1:3)) %>%
+     select(-(31:33)) %>%
+     select(-(8:10)) %>%
+     select(-(4))
+```
+## Cross Validation
+The large dataset allowed for robust cross-validation. I partitioned the data into a training set containing 60% of observations, a test set with 20% of observations, and a validation set with 20% of observations. This allowed me to train models on the training set and use the testing set to explore results and make revisions if needed, before running the final model on the validation set once only.
+
+I also used k-fold cross-validation, using 5 cross-validated folds. The large dataset allowed a smaller number of folds while still ensuring heterogeneity in each fold, which helped to avoid overfitting.
+
+
+## Model Selection
+I ruled out generalized linear models and regularized regression based on exploratory data analysis and because our response variable is a factor. Based on the structure of the data, LDA and Naive Bayes seemed unlikely to be optimal choices. Boosting methods are prone to overfitting, which I cannot easily mitigate without contextual background on the variable meanings. I therefore selected a Random Forest approach, as it was well suited to a factor response variable with a large number of predictors whose relationships were largely unknown due to lack of metadata.
+
+I used parallel processing and 5-fold cross-validation to run the random forest model.
+```{r, rfmodel, echo = TRUE}
+## set up parallel processing
+library(parallel)
+library(doParallel)
+cluster <- makeCluster(detectCores() - 1)
+registerDoParallel(cluster)
+## set the number of cross-validation folds at 5
+fitControl <- trainControl(method = "cv",
+                           number = 5,
+                           allowParallel = TRUE)
+
+##Random Forest model with parallel processing
+rf_parallel <- train(classe~., method= "rf", data = training, trControl = fitControl)
+stopCluster(cluster)
+registerDoSEQ()
+```
+
+## Results
+The random forest model performed quite well on the testing set:
+
+```{r, testing_results, echo= TRUE, results=TRUE}
+## predicting on test set
+rf1_predict <- predict(rf_parallel, newdata=testing)
+rf1_conf <- confusionMatrix(rf1_predict, testing$classe)
+acc1 <- rf1_conf$overal["Accuracy"]
+acc1_lower <- rf1_conf$overal["AccuracyUpper"]
+acc1_upper <- rf1_conf$overal["AccuracyLower"]
+kappa1 <- rf1_conf$overal["Kappa"]
+rf1_conf$overall
+```
+
+The accuracy on the testing set was **`r acc1`**, with a 95% confidence interval of **`r acc1_lower` - `r acc1_upper` accuracy**. The Kappa statistic is **`r kappa1`**, indicating a high rate of agreement not equivalent to chance.
+
+These are very good results, but I want to explore the model a little bit better. To do that, I first looked at the top 20 most important variables:
+
+```{r, impVAR, results=TRUE}
+plot(varImp(rf_parallel))
+```
+
+The plot shows that the top 7 variables are especially important for the model, with roll_belt being by far the most important. Because I'm ignorant of the predictor variables and worried about over-fitting and/or multi-collinearity, I checked whether any of these seven especially important variables are highly correlated.
+
+```{r, topcorr, echo = TRUE, results= TRUE}
+## isolate the names of the top 7 most important variables
+top_vars <- rownames(varImp(rf_parallel)$importance)[1:7]
+top_vars_data <- training[, top_vars]
+## run a correlation matrix on those
+top_corr <- cor(top_vars_data)
+## define 'high correlation' as anything above .75
+highcorr_top<- which(top_corr > 0.75 & top_corr < 1, arr.ind = TRUE)
+## use a 'for' loop to return a text result with the variables and their correlation
+for (i in 1:nrow(highcorr_top)) {
+     row_index <- highcorr_top[i, 1]
+     col_index <- highcorr_top[i, 2]
+     correlation_value <- top_corr[row_index, col_index]
+     
+     cat("Variables:", rownames(top_corr)[row_index], "and", colnames(top_corr)[col_index], 
+         "have a high correlation of", correlation_value, "\n")
+}
+```
+
+The variables roll_belt and yaw_belt are highly correlated. This is concerning, as these are the first and third most important variables. However, I decided to leave the model as-is for a few reasons:
+
+1. Random forests are robust to colinearity;
+2. The correlation is likely to inflate estimated importance of variables, so these two variables may be less important to the model than shown here;
+3. I want to avoid the risk of over-fitting the model to this dataset by tinkering with the fine details of variables I don't understand well due to lack of metadata; and
+4. The model is performing very well on the testing set as is.
+
+I next ran the model's predictions on the validation set:
+
+```{r, validation, echo = TRUE, results = TRUE}
+## predicting on validation
+rf_validation <- predict(rf_parallel, newdata= validation)
+conf <- confusionMatrix(rf_validation, validation$classe)
+acc <- conf$overal["Accuracy"]
+acc_lower <- conf$overal["AccuracyUpper"]
+acc_upper <- conf$overal["AccuracyLower"]
+kappa <- conf$overal["Kappa"]
+conf$overall
+est_acc <- 1-acc
+est_acc_lower <- 1- acc_upper
+est_acc_upper <- 1-acc_lower
+```
+
+The model performed similarly well on the validation set: Accuracy was **`r acc`** with a 95% confidence interval of **`r acc_lower` - `r acc_upper`**, and a Kappa statistic of **`r kappa`**.
+
+**Based on this result, the expected out of sample error is 1 - accuracy, which is `r est_acc`. The 95% confidence interval for our of sample error is `r est_acc_lower` - `r est_acc_upper`.**
+
+Finally, I wanted to explore the errors that did occur. The following heatmap displays the proportion of mistaken predictions for each combination of 'classe' levels:
+
+```{r, heatmap, results=TRUE}
+## create dataframe with only the incorrect predictions, their true values, and the frequency of that error
+confusion_df <- as.data.frame(conf$table)
+conf_wrong <- confusion_df %>%
+     filter(Prediction != Reference)
+##heat map of errors, with the results calculated as proportions of total errors
+ggplot(conf_wrong, aes(x = Reference, y = Prediction, fill = Freq/sum(Freq))) +
+     geom_tile(color = "white") +
+     scale_fill_gradient(low = "white", high = "red") +
+     labs(title = "Misclassifications Heatmap", x = "True Class", 
+          y = "Predicted Class", fill = "Proportion of Misclassifications") +
+     theme_minimal()
+```
+
+The heat map shows that the model has the most trouble mis-predicting true values of classe D as classe C. These acount for nearly one-third of errors. Mistaking classe B for classe A is the second most common, with all other error types much less common.
+
+##Appendix
+
+Below is the code that I used to examine correlations between variables in the original dataset, after first removing variables on logical grounds as described above. The code results in written descriptions of highly correlated variables.
+
+```{r correlations, echo = TRUE, results = TRUE}
+data <- read.csv("~/R/Coursera/MachineLearning_Project/pml-training.csv")
+test_set_quiz <- read.csv("~/R/Coursera/MachineLearning_Project/pml-testing.csv")
+
+## pre-process data
+library(dplyr)
+data <- data %>%
+     mutate(classe = as.factor(classe))
+
+set.seed(1234)
+library(mlbench)
+## slice training set into train (60%), test (20%), and validation (20%) sets
+library(caret)
+train_index <- createDataPartition(y = data$classe, p = 0.8, list = FALSE)
+test_index <- createDataPartition(y = train_index, p = 0.25, list = FALSE)
+training <- data[train_index[-test_index], ]
+testing <- data[train_index[test_index], ]
+validation <- data[-c(train_index, train_index[test_index]), ]
+
+## remove columns with at least half of cells NA or blank
+training <- training %>%
+     select_if(~ sum(!is.na(.) & . != "") >= 19622/2) %>%
+     select(-(1:7))
+## create correlation matrix with 0's at diagonal
+corr <- abs(cor(training[ ,-53]))
+diag(corr) <- 0
+## Identify variables with high correlation
+high_corr_vars <- which(corr > 0.8 & corr < 1, arr.ind = TRUE)
+# Display the variables and their correlation values
+for (i in 1:nrow(high_corr_vars)) {
+     row_index <- high_corr_vars[i, 1]
+     col_index <- high_corr_vars[i, 2]
+     correlation_value <- corr[row_index, col_index]
+     
+     cat("Variables:", rownames(corr)[row_index], "and", colnames(corr)[col_index], 
+         "have a high correlation of", correlation_value, "\n")
+}
